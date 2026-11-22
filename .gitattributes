@@ -1,0 +1,4 @@
+# Carriage returns are significant in the competition CSV dialect.
+fixtures/** -text
+*.sh text eol=lf
+Makefile text eol=lf

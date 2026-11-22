@@ -1,0 +1,15 @@
+data/
+dev/
+dev-answer/
+generator/
+output/
+out/
+scratch/
+.venv/
+__pycache__/
+*.pyc
+target/
+*.duckdb
+*.parquet
+*.zip
+.vscode/

@@ -1,0 +1,13 @@
+data/
+dev/
+fixtures/
+fixtures.zip
+output/
+out/
+scratch/
+.venv/
+rust_engine/target/
+target/
+.git/
+.vscode/
+*.md

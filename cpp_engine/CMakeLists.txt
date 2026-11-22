@@ -1,0 +1,28 @@
+cmake_minimum_required(VERSION 3.20)
+project(shopping_sessions_cpp LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+find_package(nlohmann_json 3.11 REQUIRED)
+find_package(Threads REQUIRED)
+
+add_library(session_engine src/engine.cpp)
+target_include_directories(session_engine PUBLIC include)
+target_link_libraries(session_engine PRIVATE nlohmann_json::nlohmann_json Threads::Threads)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(session_engine PRIVATE -Wall -Wextra -Wconversion)
+endif()
+
+add_executable(cpp_engine src/main.cpp)
+target_link_libraries(cpp_engine PRIVATE session_engine)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_link_options(cpp_engine PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(engine_tests tests/engine_tests.cpp)
+    target_link_libraries(engine_tests PRIVATE session_engine)
+    add_test(NAME engine_tests COMMAND engine_tests)
+endif()
