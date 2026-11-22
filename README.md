@@ -112,6 +112,30 @@ The local Docker VM had 3.68 GiB. The 30M and 60M workloads require further
 memory and runtime measurements on a larger Linux machine. These local
 measurements give no official score for the C++ branch.
 
+### Reusable builders experiment
+
+The C++ candidate builds sessions and user-day totals in one pass over sorted
+events and releases the event array before loading clicks. It reuses category
+totals across user-days and campaign counts across attribution windows.
+
+| Local workload | Runs per build | Release median | Candidate median |
+|---|---:|---:|---:|
+| Public dev, 1M events | 3 | 1.905 s | 1.778 s |
+| Generated, 6M events and 1.5M clicks | 5 | 16.262 s | 17.395 s |
+| Attribution stage on the 6M workload | 5 | 0.260 s | 0.113 s |
+
+The benchmark alternated images on Linux-managed volumes with warmed caches.
+Staging took 4.01 s on dev and 17.17 s and 17.40 s across the two 6M batches.
+Wall times exclude staging and comparison. The 6M wall times ranged from
+12.15 to 20.28 s for the release and 12.14 to 24.27 s for the candidate.
+The event-shard stage varied most across builds. The candidate's higher
+combined 6M wall-time median leaves the experiment on a separate branch.
+
+CTest, all 42 Rust unit tests, and all 36 official Docker fixtures passed.
+Both builds passed a focused check of overlapping clicks, campaign expiry,
+and the inclusive seven-day boundary. The public dev outputs matched the
+published answer, and the generated outputs matched the release exactly.
+
 ## What to do first
 
 - Read the official rules before changing the engine or export.

@@ -607,25 +607,10 @@ void load_clicks(Input& input, const Path& data, Window window, Identities& ids,
 }
 
 struct Session {
-    std::size_t first;
-    std::size_t end;
+    Integer start;
     Integer revenue;
+    Key user;
 };
-
-std::vector<Session> sessions_for(const std::vector<Event>& events) {
-    std::vector<Session> sessions;
-    for (std::size_t i = 0; i < events.size(); ++i) {
-        const auto& event = events[i];
-        if (i == 0 || event.user != events[i - 1].user ||
-            gap_exceeds(event.time, events[i - 1].time, session_ms)) {
-            sessions.push_back({i, i + 1, event.revenue});
-        } else {
-            sessions.back().end = i + 1;
-            add(sessions.back().revenue, event.revenue);
-        }
-    }
-    return sessions;
-}
 
 struct UserRow {
     Key user;
@@ -636,44 +621,90 @@ struct UserRow {
     std::optional<Key> highest_category;
 };
 
-std::vector<UserRow> aggregate_users(const std::vector<Event>& events,
-                                     const std::vector<Session>& sessions, const Names& categories) {
-    std::vector<UserRow> result;
-    std::unordered_map<Key, Integer> category_revenue;
-    const auto finish_group = [&] {
-        if (result.empty()) {
+class UserDailyBuilder {
+public:
+    explicit UserDailyBuilder(const Names& categories)
+        : categories_(categories), category_revenue_(categories.size(), 0) {}
+
+    void start_session(Key user, Integer day) {
+        if (rows_.empty() || rows_.back().user != user || rows_.back().day != day) {
+            finish_group();
+            rows_.push_back(UserRow{user, day, 0, 0, 0, std::nullopt});
+        }
+    }
+
+    void purchase(Key category, Integer revenue) {
+        auto& total = category_revenue_[category];
+        if (total == 0) {
+            touched_.push_back(category);
+        }
+        add(total, revenue);
+    }
+
+    void finish_session(Integer events, Integer revenue) {
+        auto& row = rows_.back();
+        add(row.sessions, 1);
+        add(row.events, events);
+        add(row.revenue, revenue);
+    }
+
+    std::vector<UserRow> finish() {
+        finish_group();
+        return std::move(rows_);
+    }
+
+private:
+    const Names& categories_;
+    std::vector<UserRow> rows_;
+    std::vector<Integer> category_revenue_;
+    std::vector<Key> touched_;
+
+    void finish_group() {
+        if (touched_.empty()) {
             return;
         }
-        auto& best = result.back().highest_category;
+        auto& best = rows_.back().highest_category;
         Integer best_revenue = 0;
-        for (const auto& [category, revenue] : category_revenue) {
+        for (const auto category : touched_) {
+            auto& revenue = category_revenue_[category];
             if (!best || revenue > best_revenue ||
-                (revenue == best_revenue && categories.name(category) < categories.name(*best))) {
+                (revenue == best_revenue && categories_.name(category) < categories_.name(*best))) {
                 best = category;
                 best_revenue = revenue;
             }
+            revenue = 0;
         }
-        category_revenue.clear();
-    };
-    for (const auto& session : sessions) {
-        const auto& first = events[session.first];
-        const auto day = utc_day(first.time);
-        if (result.empty() || result.back().user != first.user || result.back().day != day) {
-            finish_group();
-            result.push_back(UserRow{first.user, day, 0, 0, 0, std::nullopt});
-        }
-        auto& row = result.back();
-        add(row.sessions, 1);
-        add(row.events, static_cast<Integer>(session.end - session.first));
-        add(row.revenue, session.revenue);
-        for (auto i = session.first; i < session.end; ++i) {
-            const auto& event = events[i];
-            if (event.revenue > 0) {
-                add(category_revenue[event.category], event.revenue);
-            }
-        }
+        touched_.clear();
     }
-    finish_group();
+};
+
+struct SessionReports {
+    std::vector<Session> sessions;
+    std::vector<UserRow> users;
+};
+
+SessionReports build_session_reports(const std::vector<Event>& events, const Names& categories) {
+    SessionReports result;
+    UserDailyBuilder users(categories);
+    std::size_t next = 0;
+    while (next < events.size()) {
+        const auto first = next;
+        const auto& initial = events[first];
+        Session session{initial.time, 0, initial.user};
+        users.start_session(session.user, utc_day(session.start));
+        do {
+            const auto& event = events[next++];
+            add(session.revenue, event.revenue);
+            if (event.revenue > 0) {
+                users.purchase(event.category, event.revenue);
+            }
+        } while (next < events.size() && events[next].user == session.user &&
+                 !gap_exceeds(events[next].time, events[next - 1].time, session_ms));
+
+        users.finish_session(static_cast<Integer>(next - first), session.revenue);
+        result.sessions.push_back(session);
+    }
+    result.users = users.finish();
     return result;
 }
 
@@ -686,35 +717,67 @@ struct CampaignTotals {
 
 using CampaignDaily = std::vector<std::unordered_map<Integer, CampaignTotals>>;
 
-CampaignDaily attribute(const std::vector<Event>& events, const std::vector<Session>& sessions,
+class ActiveCampaigns {
+public:
+    explicit ActiveCampaigns(std::size_t count) : counts_(count, 0), positions_(count, 0) {}
+
+    void enter(Key campaign) {
+        if (counts_[campaign]++ == 0) {
+            positions_[campaign] = ids_.size();
+            ids_.push_back(campaign);
+        }
+    }
+
+    void expire(Key campaign) {
+        if (--counts_[campaign] == 0) {
+            const auto last = ids_.back();
+            const auto position = positions_[campaign];
+            ids_[position] = last;
+            positions_[last] = position;
+            ids_.pop_back();
+        }
+    }
+
+    void reset() {
+        for (const auto campaign : ids_) {
+            counts_[campaign] = 0;
+        }
+        ids_.clear();
+    }
+
+    const std::vector<Key>& ids() const { return ids_; }
+
+private:
+    std::vector<std::size_t> counts_;
+    std::vector<std::size_t> positions_;
+    std::vector<Key> ids_;
+};
+
+CampaignDaily attribute(const std::vector<Session>& sessions,
                         const std::vector<Click>& clicks, Key organic, std::size_t campaigns) {
     CampaignDaily daily(campaigns);
-    std::unordered_map<Key, std::size_t> active;
+    ActiveCampaigns active(campaigns);
     std::size_t left = 0;
     std::size_t right = 0;
     std::optional<Key> previous;
     for (const auto& session : sessions) {
-        const auto& first = events[session.first];
-        const auto user = first.user;
-        const auto day = utc_day(first.time);
+        const auto user = session.user;
+        const auto day = utc_day(session.start);
         if (!previous || *previous != user) {
             while (right < clicks.size() && clicks[right].user < user) {
                 ++right;
             }
             left = right;
-            active.clear();
+            active.reset();
             previous = user;
         }
-        while (right < clicks.size() && clicks[right].user == user && clicks[right].time <= first.time) {
-            ++active[clicks[right++].campaign];
+        while (right < clicks.size() && clicks[right].user == user && clicks[right].time <= session.start) {
+            active.enter(clicks[right++].campaign);
         }
-        while (left < right && gap_exceeds(first.time, clicks[left].time, attribution_ms)) {
-            const auto entry = active.find(clicks[left++].campaign);
-            if (--entry->second == 0) {
-                active.erase(entry);
-            }
+        while (left < right && gap_exceeds(session.start, clicks[left].time, attribution_ms)) {
+            active.expire(clicks[left++].campaign);
         }
-        for (const auto& [campaign, count] : active) {
+        for (const auto campaign : active.ids()) {
             add(daily[campaign][day].assisted_sessions, 1);
         }
         Key credited = organic;
@@ -927,11 +990,10 @@ void run(const Path& data, const Path& reports) {
     profile("event_sort_seconds", start);
 
     start = Clock::now();
-    const auto sessions = sessions_for(events);
-    profile("sessionize_seconds", start);
-    start = Clock::now();
-    const auto user_rows = aggregate_users(events, sessions, products.labels);
-    profile("user_aggregate_seconds", start);
+    const auto event_count = static_cast<Integer>(events.size());
+    const auto session_reports = build_session_reports(events, products.labels);
+    std::vector<Event>().swap(events);
+    profile("session_user_aggregate_seconds", start);
 
     Catalog campaigns;
     load_catalog(input, data / "campaigns.csv", campaigns);
@@ -945,11 +1007,12 @@ void run(const Path& data, const Path& reports) {
     profile("click_sort_seconds", start);
 
     start = Clock::now();
-    const auto campaign_rows = attribute(events, sessions, clicks.records, organic, campaigns.ids.size());
+    const auto campaign_rows = attribute(
+        session_reports.sessions, clicks.records, organic, campaigns.ids.size());
     profile("attribute_seconds", start);
     start = Clock::now();
-    write_reports(reports, user_rows, identities, products.labels, campaign_rows, campaigns,
-                  static_cast<Integer>(events.size()), static_cast<Integer>(sessions.size()));
+    write_reports(reports, session_reports.users, identities, products.labels, campaign_rows, campaigns,
+                  event_count, static_cast<Integer>(session_reports.sessions.size()));
     profile("csv_export_seconds", start);
     std::cout << "[INNER] input_read_seconds " << input.read_seconds << '\n';
     if (input.map_partitions) {
