@@ -3,11 +3,13 @@
 # Engine builders
 # =====================================================
 
-FROM rust:1-bookworm AS cpp_builder
+FROM rust:1-bookworm AS cpp_toolchain
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends g++ cmake nlohmann-json3-dev \
     && rm -rf /var/lib/apt/lists/*
+
+FROM cpp_toolchain AS cpp_builder
 COPY cpp_engine/ /build/cpp_engine/
 RUN cmake -S /build/cpp_engine -B /build/cpp -DCMAKE_BUILD_TYPE=Release -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
     && cmake --build /build/cpp --parallel 4 \
@@ -70,4 +72,31 @@ ENV SESSION_ENGINE=/app/cpp_engine
 FROM cpp AS cpp_mmap
 ENV SESSION_MMAP=1
 
-FROM cpp_mmap AS competition
+FROM python:3.12-slim-bookworm AS arrow_sdk
+
+RUN pip install --no-cache-dir --no-deps --only-binary=:all: --target /wheel pyarrow==23.0.1 \
+    && mkdir -p /arrow/lib \
+    && cp -r /wheel/pyarrow/include /arrow/include \
+    && cp /wheel/pyarrow/libarrow.so.2300 /wheel/pyarrow/libparquet.so.2300 /arrow/lib/ \
+    && ln -s libarrow.so.2300 /arrow/lib/libarrow.so \
+    && ln -s libparquet.so.2300 /arrow/lib/libparquet.so \
+    && cp -r /wheel/pyarrow-*.dist-info/licenses /arrow/licenses
+
+FROM cpp_toolchain AS native_builder
+COPY cpp_engine/ /build/cpp_engine/
+COPY --from=arrow_sdk /arrow /arrow
+RUN cmake -S /build/cpp_engine -B /build/native -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON -DSHOPPING_ARROW_ROOT=/arrow \
+    && cmake --build /build/native --parallel 4 \
+    && ctest --test-dir /build/native --output-on-failure \
+    && cmake --install /build/native --prefix /native
+
+FROM debian:bookworm-slim AS competition
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=arrow_sdk /arrow/lib/*.so.2300 /app/lib/
+COPY --from=arrow_sdk /arrow/licenses /app/licenses/arrow/
+COPY --from=native_builder /native/cpp_engine /app/cpp_engine
+ENV SESSION_MMAP=1
+CMD ["/app/cpp_engine"]

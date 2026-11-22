@@ -30,14 +30,7 @@ SCHEMAS = {
         "purchasing_sessions": pl.Int64, "revenue_cents": pl.Int64, "assisted_sessions": pl.Int64,
     },
 }
-EVICT = """
-import os
-from pathlib import Path
-for path in Path("/data").rglob("*"):
-    if path.is_file():
-        with path.open("rb") as handle:
-            os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-"""
+EVICT = r"find /data -type f -exec dd if={} iflag=nocache count=0 status=none \;"
 
 
 def command(*args):
@@ -87,6 +80,10 @@ def main():
         "--evict", action="store_true",
         help="Request Linux page-cache eviction for staged input before each run",
     )
+    parser.add_argument(
+        "--profile-python-runtime", action="store_true",
+        help="Use the in-container profiler for images with Python and /app/run.sh",
+    )
     parser.add_argument("images", nargs="+", help="LABEL=IMAGE in baseline-to-candidate order")
     args = parser.parse_args()
     if args.trials < 1:
@@ -114,14 +111,17 @@ def main():
         directory = output / f"{label}-{turn}"
         directory.mkdir()
         if args.evict:
-            command("docker", "run", "--rm", "--platform", "linux/amd64", "--network", "none",
-                    "--read-only", *volume("data", True), "--entrypoint", "python3",
-                    images[baseline], "-c", EVICT)
+            helper(volume("data", True), EVICT)
+        runtime = [images[label]]
+        if args.profile_python_runtime:
+            runtime = [
+                *mount("bind", Path(__file__).with_name("profile_container.py").resolve(), "profile.py", True),
+                "--entrypoint", "python3", images[label], "/profile.py",
+            ]
         start = time.perf_counter()
         log = command(
             "docker", "run", *FLAGS, *volume("data", True), *volume("scratch"), *volume("output"),
-            *mount("bind", Path(__file__).with_name("profile_container.py").resolve(), "profile.py", True),
-            "--entrypoint", "python3", images[label], "/profile.py",
+            *runtime,
         )
         wall = time.perf_counter() - start
         (directory / "profile.log").write_text(log, encoding="utf-8")

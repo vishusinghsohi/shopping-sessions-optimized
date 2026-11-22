@@ -2,11 +2,14 @@
 
 ## Competition build
 
-The default Docker target builds `cpp_engine/` with CMake,
-runs CTest during the image build, maps read-only event and click partitions,
-enables link-time optimization, and uses the typed DuckDB export. The `cpp` target reads partitions
-into owned buffers. The `rust` target runs the tracked Rust fallback with the
-same entrypoint and export. Run these commands from the repository root.
+The default Docker target builds `cpp_engine/` with CMake and link-time
+optimization, runs CTest, and maps read-only event and click partitions.
+The C++ binary writes both reports directly with Arrow and Snappy compression
+in batches of up to 65,536 rows. The final image launches the binary directly.
+The linux/amd64 competition build targets x86-64-v3 and uses an AVX2
+fast path for unquoted rows. Its scalar parser handles quoted rows.
+The `cpp`, `cpp_mmap`, and `rust` targets retain the DuckDB export for local
+comparisons and fallback runs. Run these commands from the repository root.
 
 ```sh
 docker build --no-cache --platform linux/amd64 --target competition -t shopping-sessions:cpp23 .
@@ -35,8 +38,9 @@ python cpp_engine/benchmark.py --data path/to/dev --answer path/to/dev-answer --
 ```
 
 The benchmark stages the input into a Linux-managed Docker volume, warms each
-image once, and alternates measured runs. It records staging separately and
-checks both Parquet tables after timing. Keep the logs and `summary.json` files
+image once, and alternates timed runs of each image's default command.
+It records staging separately and checks both Parquet tables after timing.
+Keep the logs and `summary.json` files
 under `scratch/`. Generated competition inputs and answers belong outside Git.
 The optional `--evict` flag requests Linux page-cache eviction of the staged
 files before each run. Other storage caches may still be warm.
@@ -50,18 +54,60 @@ because a carriage return is data in the competition CSV dialect.
 python scripts/verify_fixture_bytes.py path/to/starter-duckdb.zip
 ```
 
-The C++ loader scans contiguous ranges of the event files in parallel and
-routes each ID to one shard. Each shard visits its ranges in file-and-line
-order, keeps the earliest-ingest winner per ID, and then validates that
-winner. The click loader keeps the first occurrence of each click ID in a
-contiguous lookup table. Both loaders compare full ID bytes. Input buffers or
+The C++ loaders scan contiguous ranges of event and click files in parallel
+and route each ID to one shard. Each shard visits its ranges in file-and-line
+order. Event shards keep the earliest-ingest winner per ID. Click shards
+keep the first occurrence. Both compare full ID bytes and preserve order
+within a shard. Input buffers or
 read-only mappings own every borrowed view until the engine materializes the
-needed values. The current engine keeps winners and sorted events in memory.
+needed values. A parallel radix sort orders large batches by canonical user
+and timestamp before the engine builds sessions. The engine keeps winners
+and sorted events in memory.
 
 The [official rules](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md)
 define the CSV dialect, output schemas, and all attribution rules.
 
 ### Local benchmark report
+
+In the release comparison, three timed runs per build used the same staged
+6M-event, 1.5M-click input. Both output tables matched. Staging took
+17.514 s and was measured separately.
+
+| Median stage time | Scored build `7f85080` | Tuned competition build |
+|---|---:|---:|
+| Docker wall time | 9.438 s | 8.509 s |
+| Click routing, deduplication, validation, and identity merge | 2.059 s | 1.045 s |
+| Event sort | 0.585 s | 0.358 s |
+| Report output | 0.442 s | 0.186 s |
+
+The AVX2 and radix build ran in a 6M Docker median of 8.106 s versus 8.413 s
+for the native sharded build with the same input and three runs per build.
+Median event sort time fell from 0.591 s to 0.312 s. The tuned build's wall
+times ranged from 6.275 s to 16.128 s. All timed outputs matched. In the
+public dev comparison, the tuned and native sharded builds ran in medians
+of 1.309 s and 1.436 s across two trials each.
+
+Native Parquet output and sharded click ingestion were compared with the
+`7f85080` competition build using the real Docker commands. Three timed runs
+per image used the same staged 6M-event, 1.5M-click dataset. Staging took
+31.094 s. The benchmark excluded staging and output comparison from wall time.
+
+| Build | Median wall time | Median click ingestion | Median report output |
+|---|---:|---:|---:|
+| Previous competition build | 11.461 s | 2.069 s | 0.483 s |
+| Native Parquet only | 9.292 s | 2.341 s | 0.186 s |
+| Native Parquet and sharded clicks | 9.048 s | 1.504 s | 0.152 s |
+
+An earlier 6M pair had medians of 11.197 s for `7f85080` and 11.660 s for
+native Parquet alone. The native writer shortened the output stage in both
+batches. The sharded build's public dev median was 1.932 s versus 1.959 s for
+`7f85080` across three runs per image. Both outputs matched the published
+dev answer and the generated reference. CTest, all 42 Rust unit tests,
+all 36 Docker fixtures, and a duplicate ordering regression passed.
+
+The last reported official runtime for `7f85080` was 22.2246 s.
+
+#### Parallel event routing
 
 Parallel ingestion reduced median Docker wall time from **16.703 s to
 13.629 s** on 6 million generated events and 1.5 million clicks. Three timed
@@ -136,7 +182,7 @@ measurements give no official score for the C++ branch.
 ## What to do first
 
 - Read the official rules before changing the engine or export.
-- Use `cpp_engine/` for C++ processing and `pipeline/pipeline.py` for typed export.
+- Use `cpp_engine/` for competition processing and Parquet output.
 - Build the image and test against all 36 edge-case fixtures and the 1M-event dev set before submitting.
 
 ## Run and test locally
@@ -194,7 +240,7 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 
 - **DuckDB's CSV reader differs from `rules.md`.** It reads a quoted empty field `""` as an empty string, not null. Its malformed-line handling, including `ignore_errors`, `strict_mode`, and `null_padding`, does not match `rules.md`. Test against the fixtures before relying on it.
 - **Memory.** `pipeline.py` sets `memory_limit` to 80% of `MEM_GB` and `temp_directory` under `/scratch`, so big joins and sorts spill to disk instead of getting the container killed.
-- **No extension downloads.** The container has no network at run time. Parquet and CSV are built into the wheel; anything else must be installed at build time.
+- **Offline runtime.** The image packages its Arrow and Parquet libraries at build time.
 - **`\d` is not `[0-9]`.** In several regex engines, including Rust's used by Polars, `\d` matches any Unicode digit. The rules mean ASCII digits only.
 - **Extra files in output folders.** `_SUCCESS` and other non-Parquet files in the output folders are ignored.
 
@@ -206,7 +252,7 @@ Scorers are Google Cloud n2 Intel Xeon machines, Cascade Lake or newer, with AVX
 
 ## Files in this starter
 
-- `pipeline/pipeline.py` holds your pipeline code.
+- `cpp_engine/` holds the competition pipeline. `pipeline/pipeline.py` exports the fallback reports.
 - `Dockerfile` builds a `linux/amd64` image for the Intel Xeon scorers.
 - `fixtures/` holds the 36 edge cases, each an `input/` folder and the `expected/` tables. In this monorepo they live in `../../fixtures`; copy them in when publishing the starter as its own repo.
 - `scripts/` runs your image the way the scorer does and diffs the output.

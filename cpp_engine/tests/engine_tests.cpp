@@ -3,6 +3,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 using namespace std::string_view_literals;
 using namespace shopping;
@@ -21,6 +22,19 @@ int main() {
         require(!parse_csv<2>("a,\"b"sv) && !parse_csv<2>("a,b\""sv), "CSV malformed quotes");
         require(!parse_csv<2>("\"a,b\",c"sv) && !parse_csv<2>(""sv), "CSV dialect");
         require(parse_csv<2>("a,"sv)->at(1).empty(), "CSV trailing null");
+        for (const auto width : {30, 31, 32, 33, 62, 63, 64, 65}) {
+            const std::string id(static_cast<std::size_t>(width), 'a');
+            for (const auto& line : {
+                     id + ",b,c,d,e,f,",
+                     id + ",\"b\",c,d,e,f,",
+                     id + ",\"b,c,d,e,f,",
+                     id + ",b,c,d,e,f",
+                     id + ",b,c,d,e,f,g,",
+                 }) {
+                require(parse_csv<7>(line) == detail::parse_csv_scalar<7>(line),
+                        "CSV delimiter and quote boundaries");
+            }
+        }
         const auto utc = timestamp("2026-10-03T23:58:10Z");
         require(utc && utc == timestamp("2026-10-03T19:58:10-04:00"), "UTC offset");
         require(utc == timestamp("2026-10-03T23:58:10-00:00"), "negative zero");

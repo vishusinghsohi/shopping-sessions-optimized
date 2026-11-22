@@ -1,5 +1,9 @@
 #include "engine.hpp"
 
+#if defined(SHOPPING_NATIVE_PARQUET)
+#include "parquet_output.hpp"
+#endif
+
 #include <algorithm>
 #include <bit>
 #include <cerrno>
@@ -272,6 +276,7 @@ public:
 
     Key canonical(View user) { return components_[root(intern(user))].minimum; }
     View name(Key key) const { return names_.name(key); }
+    std::size_t size() const { return components_.size(); }
 
 private:
     struct Component {
@@ -435,9 +440,74 @@ void run_workers(std::size_t count, Task task) {
     }
 }
 
+struct alignas(64) RadixBins {
+    std::array<std::size_t, 256> offsets;
+};
+
+template<class Digit>
+void event_radix_pass(std::vector<Event>& records, std::vector<Event>& workspace,
+                      std::vector<RadixBins>& bins, Digit digit) {
+    const auto workers = bins.size();
+    const auto begin = [&](std::size_t worker) { return records.size() * worker / workers; };
+    run_workers(workers, [&](std::size_t worker) {
+        auto& counts = bins[worker].offsets;
+        counts.fill(0);
+        for (auto i = begin(worker); i < begin(worker + 1); ++i) {
+            ++counts[digit(records[i])];
+        }
+    });
+
+    std::size_t offset = 0;
+    std::size_t populated = 0;
+    for (std::size_t value = 0; value < 256; ++value) {
+        const auto start = offset;
+        for (auto& bin : bins) {
+            const auto count = bin.offsets[value];
+            bin.offsets[value] = offset;
+            offset += count;
+        }
+        populated += offset != start;
+    }
+    if (populated <= 1) {
+        return;
+    }
+
+    run_workers(workers, [&](std::size_t worker) {
+        auto& offsets = bins[worker].offsets;
+        for (auto i = begin(worker); i < begin(worker + 1); ++i) {
+            const auto& record = records[i];
+            workspace[offsets[digit(record)]++] = record;
+        }
+    });
+    records.swap(workspace);
+}
+
+void sort_events(std::vector<Event>& events, Window window, std::size_t identities) {
+    const auto workers = worker_budget();
+    if (workers < 2 || events.size() < 65'536) {
+        std::ranges::sort(events, {}, [](const Event& event) { return std::pair{event.user, event.time}; });
+        return;
+    }
+    std::vector<Event> workspace(events.size());
+    std::vector<RadixBins> bins(workers);
+    const auto origin = static_cast<std::uint64_t>(window.start);
+    const auto max_delta = static_cast<std::uint64_t>(window.end) - origin - 1;
+    // Stable least-significant-digit passes produce (canonical user, time) order.
+    for (unsigned shift = 0; shift < std::bit_width(max_delta); shift += 8) {
+        event_radix_pass(events, workspace, bins, [&](const Event& event) {
+            return ((static_cast<std::uint64_t>(event.time) - origin) >> shift) & 255;
+        });
+    }
+    for (unsigned shift = 0; shift < std::bit_width(identities - 1); shift += 8) {
+        event_radix_pass(events, workspace, bins, [&](const Event& event) {
+            return (event.user >> shift) & 255;
+        });
+    }
+}
+
 using RowBatches = std::vector<std::vector<std::vector<View>>>;
 
-RowBatches route_events(const std::vector<Partition>& storage, std::size_t workers) {
+RowBatches route_rows(const std::vector<Partition>& storage, std::size_t workers) {
     std::size_t bytes = 0;
     std::vector<View> bodies;
     bodies.reserve(storage.size());
@@ -448,7 +518,7 @@ RowBatches route_events(const std::vector<Partition>& storage, std::size_t worke
     }
 
     // Readers own contiguous ranges in file order. Split large files at a
-    // newline to balance work without reordering equal-ingest duplicates.
+    // newline to balance work without reordering duplicates.
     std::vector<std::vector<View>> ranges(workers);
     const auto target = bytes / workers + (bytes % workers != 0);
     std::size_t reader = 0;
@@ -494,6 +564,11 @@ struct IndexedWinner {
     Winner record;
 };
 
+std::size_t shard_slot(View id, std::size_t mask) {
+    // Shard routing already uses the lowest hash bits on power-of-two worker counts.
+    return std::rotr(std::hash<View>{}(id), 3) & mask;
+}
+
 std::vector<IndexedWinner> choose_winners(RowBatches& routed, std::size_t shard) {
     std::size_t row_count = 0;
     for (const auto& batches : routed) {
@@ -518,7 +593,7 @@ std::vector<IndexedWinner> choose_winners(RowBatches& routed, std::size_t shard)
             return;
         }
         const auto id = (*fields)[0];
-        auto slot = std::hash<View>{}(id) & (bucket_count - 1);
+        auto slot = shard_slot(id, bucket_count - 1);
         while (buckets[slot] != 0 && winners[buckets[slot] - 1].id != id) {
             slot = (slot + 1) & (bucket_count - 1);
         }
@@ -547,6 +622,21 @@ struct EventShard {
     double dedup_seconds = 0;
     double validate_seconds = 0;
 };
+
+template<class Record>
+void merge_shard(std::vector<Record>& records, const std::vector<View>& local_users,
+                 Identities& identities, std::vector<Record>& merged) {
+    std::vector<Key> keys;
+    keys.reserve(local_users.size());
+    for (const auto user : local_users) {
+        keys.push_back(identities.canonical(user));
+    }
+    for (auto record : records) {
+        record.user = keys[record.user];
+        merged.push_back(record);
+    }
+    std::vector<Record>().swap(records);
+}
 
 EventShard load_shard(RowBatches& routed, std::size_t index, Window window,
                       const Catalog& products, Key unknown) {
@@ -586,7 +676,7 @@ std::vector<Event> load_events(Input& input, const Path& data, Window window, Id
     // views in the shard inputs and outputs borrow from immutable storage.
     start = Clock::now();
     const auto workers = worker_budget();
-    auto routed = route_events(storage, workers);
+    auto routed = route_rows(storage, workers);
     profile("event_route_seconds", start);
 
     start = Clock::now();
@@ -611,16 +701,7 @@ std::vector<Event> load_events(Input& input, const Path& data, Window window, Id
     std::vector<Event> events;
     events.reserve(count);
     for (auto& shard : shards) {
-        std::vector<Key> keys;
-        keys.reserve(shard.users.size());
-        for (const auto user : shard.users) {
-            keys.push_back(ids.canonical(user));
-        }
-        for (auto event : shard.events) {
-            event.user = keys[event.user];
-            events.push_back(event);
-        }
-        std::vector<Event>().swap(shard.events);
+        merge_shard(shard.events, shard.users, ids, events);
     }
     profile("event_merge_identity_seconds", start);
     return events;
@@ -666,13 +747,55 @@ private:
 
     static View* find_slot(std::vector<View>& slots, View id) {
         const auto mask = slots.size() - 1;
-        auto index = std::hash<View>{}(id) & mask;
+        auto index = shard_slot(id, mask);
         while (!slots[index].empty() && slots[index] != id) {
             index = (index + 1) & mask;
         }
         return &slots[index];
     }
 };
+
+struct ClickShard {
+    std::vector<View> users;
+    std::vector<Click> records;
+};
+
+ClickShard load_click_shard(RowBatches& routed, std::size_t index, Window window,
+                            const Catalog& campaigns) {
+    ClickIds seen;
+    std::unordered_map<View, Key> users;
+    ClickShard shard;
+    const auto consider = [&](View line) {
+        const auto fields = parse_csv<4>(line);
+        if (!fields || (*fields)[0].empty()) {
+            return;
+        }
+        const auto [id, user, campaign_name, click_time] = *fields;
+        if (!seen.insert(id) || user.empty() || !valid_utf8(id) || !valid_utf8(user)) {
+            return;
+        }
+        const auto campaign = campaigns.ids.find(campaign_name);
+        const auto time = timestamp(click_time);
+        if (!campaign || !time || *time >= window.end || gap_exceeds(window.start, *time, attribution_ms)) {
+            return;
+        }
+        if (shard.users.size() >= std::numeric_limits<Key>::max()) {
+            throw std::overflow_error("too many distinct click identities");
+        }
+        const auto [key, inserted] = users.try_emplace(user, static_cast<Key>(shard.users.size()));
+        if (inserted) {
+            shard.users.push_back(user);
+        }
+        shard.records.push_back({id, *time, key->second, *campaign});
+    };
+    for (auto& batches : routed) {
+        for (const auto line : batches[index]) {
+            consider(line);
+        }
+        std::vector<View>().swap(batches[index]);
+    }
+    return shard;
+}
 
 void load_clicks(Input& input, const Path& data, Window window, Identities& ids,
                  const Catalog& campaigns, Clicks& clicks) {
@@ -684,24 +807,22 @@ void load_clicks(Input& input, const Path& data, Window window, Identities& ids,
     }
     profile(input.map_partitions ? "click_map_seconds" : "click_read_seconds", start);
     start = Clock::now();
-    ClickIds seen;
-    for (const auto& file : clicks.storage) {
-        rows(file.view(), [&](View line) {
-            const auto fields = parse_csv<4>(line);
-            if (!fields || (*fields)[0].empty()) {
-                return;
-            }
-            const auto [id, user, campaign_name, click_time] = *fields;
-            if (!seen.insert(id) || user.empty() || !valid_utf8(id) || !valid_utf8(user)) {
-                return;
-            }
-            const auto campaign = campaigns.ids.find(campaign_name);
-            const auto time = timestamp(click_time);
-            if (campaign && time && *time < window.end &&
-                !gap_exceeds(window.start, *time, attribution_ms)) {
-                clicks.records.push_back({id, *time, ids.canonical(user), *campaign});
-            }
-        });
+    const auto workers = worker_budget();
+    auto routed = route_rows(clicks.storage, workers);
+    profile("click_route_seconds", start);
+
+    start = Clock::now();
+    std::vector<ClickShard> shards(workers);
+    run_workers(workers, [&](std::size_t index) {
+        shards[index] = load_click_shard(routed, index, window, campaigns);
+    });
+    std::size_t count = 0;
+    for (const auto& shard : shards) {
+        count += shard.records.size();
+    }
+    clicks.records.reserve(count);
+    for (auto& shard : shards) {
+        merge_shard(shard.records, shard.users, ids, clicks.records);
     }
     profile("click_parse_dedup_validate_seconds", start);
 }
@@ -832,6 +953,7 @@ CampaignDaily attribute(const std::vector<Event>& events, const std::vector<Sess
     return daily;
 }
 
+#if !defined(SHOPPING_NATIVE_PARQUET)
 std::string date_text(Integer day) {
     // Gregorian conversion over the full range of UTC days derived from i64
     // milliseconds. std::chrono::year has a narrower representation.
@@ -864,51 +986,108 @@ struct ReportFile {
 
     void finish() { stream.close(); }
 };
+#endif
 
 void write_reports(const Path& output, const std::vector<UserRow>& users, const Identities& identities,
                    const Names& categories, const CampaignDaily& daily, const Catalog& campaigns,
                    Integer event_count, Integer session_count) {
     std::filesystem::create_directories(output);
-    ReportFile user(output / "user_daily.csv");
-    user.stream << "user_id,day,sessions,events,revenue_cents,top_category\n";
     Integer user_sessions = 0;
     Integer user_events = 0;
     Integer user_revenue = 0;
-    for (const auto& row : users) {
-        add(user_sessions, row.sessions);
-        add(user_events, row.events);
-        add(user_revenue, row.revenue);
-        user.stream << identities.name(row.user) << ',' << date_text(row.day) << ',' << row.sessions
-                    << ',' << row.events << ',' << row.revenue << ',';
-        if (row.highest_category) {
-            user.stream << categories.name(*row.highest_category);
-        }
-        user.stream << '\n';
-    }
-    user.finish();
-
-    ReportFile campaign(output / "campaign_daily.csv");
-    campaign.stream << "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n";
     Integer campaign_sessions = 0;
     Integer campaign_revenue = 0;
-    for (Key id = 0; id < daily.size(); ++id) {
-        for (const auto& [day, row] : daily[id]) {
-            add(campaign_sessions, row.sessions);
-            add(campaign_revenue, row.revenue);
-            campaign.stream << campaigns.ids.name(id) << ',' << campaigns.label(id) << ','
-                            << date_text(day) << ',' << row.sessions << ',' << row.purchasing_sessions
-                            << ',' << row.revenue << ',' << row.assisted_sessions << '\n';
+
+    const auto user_path = output / "user_daily" / "user_daily.parquet";
+    const auto campaign_path = output / "campaign_daily" / "campaign_daily.parquet";
+    const auto write_users = [&] {
+#if defined(SHOPPING_NATIVE_PARQUET)
+        ParquetOutput<arrow::StringBuilder, arrow::Date32Builder, arrow::Int64Builder,
+                      arrow::Int64Builder, arrow::Int64Builder, arrow::StringBuilder>
+            user(user_path, {arrow::field("user_id", arrow::utf8(), false),
+                             arrow::field("day", arrow::date32(), false),
+                             arrow::field("sessions", arrow::int64(), false),
+                             arrow::field("events", arrow::int64(), false),
+                             arrow::field("revenue_cents", arrow::int64(), false),
+                             arrow::field("top_category", arrow::utf8())});
+#else
+        ReportFile user(output / "user_daily.csv");
+        user.stream << "user_id,day,sessions,events,revenue_cents,top_category\n";
+#endif
+        for (const auto& row : users) {
+            add(user_sessions, row.sessions);
+            add(user_events, row.events);
+            add(user_revenue, row.revenue);
+            const auto category = row.highest_category ? categories.name(*row.highest_category) : View{};
+#if defined(SHOPPING_NATIVE_PARQUET)
+            user.append(identities.name(row.user), parquet_day(row.day), row.sessions, row.events,
+                        row.revenue, category.empty() ? std::optional<View>{} : category);
+#else
+            user.stream << identities.name(row.user) << ',' << date_text(row.day) << ',' << row.sessions
+                        << ',' << row.events << ',' << row.revenue << ',' << category << '\n';
+#endif
         }
+        user.finish();
+    };
+    const auto write_campaigns = [&] {
+#if defined(SHOPPING_NATIVE_PARQUET)
+        ParquetOutput<arrow::StringBuilder, arrow::StringBuilder, arrow::Date32Builder,
+                      arrow::Int64Builder, arrow::Int64Builder, arrow::Int64Builder, arrow::Int64Builder>
+            campaign(campaign_path, {arrow::field("campaign_id", arrow::utf8(), false),
+                                     arrow::field("channel", arrow::utf8(), false),
+                                     arrow::field("day", arrow::date32(), false),
+                                     arrow::field("sessions", arrow::int64(), false),
+                                     arrow::field("purchasing_sessions", arrow::int64(), false),
+                                     arrow::field("revenue_cents", arrow::int64(), false),
+                                     arrow::field("assisted_sessions", arrow::int64(), false)});
+#else
+        ReportFile campaign(output / "campaign_daily.csv");
+        campaign.stream << "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n";
+#endif
+        for (Key id = 0; id < daily.size(); ++id) {
+            for (const auto& [day, row] : daily[id]) {
+                add(campaign_sessions, row.sessions);
+                add(campaign_revenue, row.revenue);
+#if defined(SHOPPING_NATIVE_PARQUET)
+                campaign.append(campaigns.ids.name(id), campaigns.label(id), parquet_day(day),
+                                row.sessions, row.purchasing_sessions, row.revenue, row.assisted_sessions);
+#else
+                campaign.stream << campaigns.ids.name(id) << ',' << campaigns.label(id) << ','
+                                << date_text(day) << ',' << row.sessions << ',' << row.purchasing_sessions
+                                << ',' << row.revenue << ',' << row.assisted_sessions << '\n';
+#endif
+            }
+        }
+        campaign.finish();
+    };
+#if defined(SHOPPING_NATIVE_PARQUET)
+    if (worker_budget() >= 2) {
+        run_workers(2, [&](std::size_t writer) {
+            if (writer == 0) {
+                write_users();
+            } else {
+                write_campaigns();
+            }
+        });
+    } else
+#endif
+    {
+        write_users();
+        write_campaigns();
     }
-    campaign.finish();
     if (user_sessions != session_count || campaign_sessions != session_count ||
         user_events != event_count || user_revenue != campaign_revenue) {
         throw std::runtime_error("report reconciliation failed");
     }
     std::cout << "Reconciliation passed, " << event_count << " events, " << session_count
               << " sessions and " << user_revenue << " cents\n";
+#if defined(SHOPPING_NATIVE_PARQUET)
+    std::cout << "Parquet output bytes: " << std::filesystem::file_size(user_path) +
+        std::filesystem::file_size(campaign_path) << '\n';
+#else
     std::cout << "CSV output bytes: " << std::filesystem::file_size(output / "user_daily.csv") +
         std::filesystem::file_size(output / "campaign_daily.csv") << '\n';
+#endif
 }
 
 } // namespace
@@ -1023,7 +1202,7 @@ void run(const Path& data, const Path& reports) {
     const Key unknown = products.labels.intern("unknown");
     auto events = load_events(input, data, window, identities, products, unknown);
     start = Clock::now();
-    std::ranges::sort(events, {}, [](const Event& event) { return std::pair{event.user, event.time}; });
+    sort_events(events, window, identities.size());
     profile("event_sort_seconds", start);
 
     start = Clock::now();
@@ -1050,7 +1229,11 @@ void run(const Path& data, const Path& reports) {
     start = Clock::now();
     write_reports(reports, user_rows, identities, products.labels, campaign_rows, campaigns,
                   static_cast<Integer>(events.size()), static_cast<Integer>(sessions.size()));
+#if defined(SHOPPING_NATIVE_PARQUET)
+    profile("parquet_export_seconds", start);
+#else
     profile("csv_export_seconds", start);
+#endif
     std::cout << "[INNER] input_read_seconds " << input.read_seconds << '\n';
     if (input.map_partitions) {
         std::cout << "[INNER] input_map_seconds " << input.map_seconds << '\n';
