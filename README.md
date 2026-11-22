@@ -50,9 +50,11 @@ because a carriage return is data in the competition CSV dialect.
 python scripts/verify_fixture_bytes.py path/to/starter-duckdb.zip
 ```
 
-The C++ loader keeps one earliest-ingest winner per event ID, then validates
-those winners. It routes event IDs to independent shards on up to eight CPUs.
-Each shard compares full ID bytes after a hash lookup. Input buffers or
+The C++ loader scans contiguous ranges of the event files in parallel and
+routes each ID to one shard. Each shard visits its ranges in file-and-line
+order, keeps the earliest-ingest winner per ID, and then validates that
+winner. The click loader keeps the first occurrence of each click ID in a
+contiguous lookup table. Both loaders compare full ID bytes. Input buffers or
 read-only mappings own every borrowed view until the engine materializes the
 needed values. The current engine keeps winners and sorted events in memory.
 
@@ -61,7 +63,26 @@ define the CSV dialect, output schemas, and all attribution rules.
 
 ### Local benchmark report
 
-The new default was selected on a paired, Linux-volume benchmark with
+Parallel ingestion reduced median Docker wall time from **16.703 s to
+13.629 s** on 6 million generated events and 1.5 million clicks. Three timed
+runs per build alternated on the same Linux-managed volumes after warmup.
+Staging took 18.075 s and was measured separately. Both output tables and
+their schemas matched across all runs.
+
+| 6M workload measurement | Previous release | Parallel ingestion |
+|---|---:|---:|
+| Docker wall time | 16.703 s | 13.629 s |
+| C++ engine time | 14.174 s | 10.864 s |
+| Event routing | 3.219 s | 0.494 s |
+
+Across two public dev batches with seven timed runs per build, the median
+Docker wall time went from 2.368 s to 2.237 s. The engine median went from
+1.193 s to 0.898 s, and every output matched the published answer. The base
+revision for these comparisons was `2fe5543`.
+
+#### Earlier measurements
+
+The previous default was selected on a paired, Linux-volume benchmark with
 6 million generated events and 1.5 million clicks. All reports matched.
 Input staging took 21.30 s and was measured separately.
 

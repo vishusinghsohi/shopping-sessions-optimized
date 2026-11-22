@@ -19,7 +19,6 @@
 #include <thread>
 #include <tuple>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -44,19 +43,14 @@ constexpr Integer session_ms = 1'800'000;
 constexpr Integer maximum = std::numeric_limits<Integer>::max();
 
 std::optional<Integer> decimal(View value, Integer limit) {
-    if (value.empty()) {
+    if (value.empty() || value.front() < '0' || value.front() > '9') {
         return std::nullopt;
     }
     Integer result = 0;
-    for (const unsigned char byte : value) {
-        if (byte < '0' || byte > '9') {
-            return std::nullopt;
-        }
-        const Integer digit = byte - '0';
-        if (result > (limit - digit) / 10) {
-            return std::nullopt;
-        }
-        result = result * 10 + digit;
+    const auto end = value.data() + value.size();
+    const auto parsed = std::from_chars(value.data(), end, result);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || result > limit) {
+        return std::nullopt;
     }
     return result;
 }
@@ -198,13 +192,13 @@ std::vector<Path> partitions(const Path& directory) {
     return paths;
 }
 
-template<class Visitor>
-void rows(View file, Visitor visit) {
+View data_rows(View file) {
     const auto header = file.find('\n');
-    if (header == file.npos) {
-        return;
-    }
-    file.remove_prefix(header + 1);
+    return header == file.npos ? View{} : file.substr(header + 1);
+}
+
+template<class Visitor>
+void visit_rows(View file, Visitor visit) {
     while (!file.empty()) {
         const auto newline = file.find('\n');
         if (newline == file.npos) {
@@ -214,6 +208,11 @@ void rows(View file, Visitor visit) {
         visit(file.substr(0, newline));
         file.remove_prefix(newline + 1);
     }
+}
+
+template<class Visitor>
+void rows(View file, Visitor visit) {
+    visit_rows(data_rows(file), visit);
 }
 
 class Names {
@@ -411,29 +410,112 @@ std::size_t worker_budget() {
     return limit;
 }
 
+template<class Task>
+void run_workers(std::size_t count, Task task) {
+    std::vector<std::exception_ptr> failures(count);
+    {
+        std::vector<std::jthread> threads;
+        threads.reserve(count - 1);
+        const auto run = [&](std::size_t index) {
+            try {
+                task(index);
+            } catch (...) {
+                failures[index] = std::current_exception();
+            }
+        };
+        for (std::size_t i = 1; i < count; ++i) {
+            threads.emplace_back(run, i);
+        }
+        run(0);
+    }
+    for (const auto& failure : failures) {
+        if (failure) {
+            std::rethrow_exception(failure);
+        }
+    }
+}
+
+using RowBatches = std::vector<std::vector<std::vector<View>>>;
+
+RowBatches route_events(const std::vector<Partition>& storage, std::size_t workers) {
+    std::size_t bytes = 0;
+    std::vector<View> bodies;
+    bodies.reserve(storage.size());
+    for (const auto& file : storage) {
+        const auto body = data_rows(file.view());
+        bodies.push_back(body);
+        bytes += body.size();
+    }
+
+    // Readers own contiguous ranges in file order. Split large files at a
+    // newline to balance work without reordering equal-ingest duplicates.
+    std::vector<std::vector<View>> ranges(workers);
+    const auto target = bytes / workers + (bytes % workers != 0);
+    std::size_t reader = 0;
+    auto remaining = target;
+    for (auto body : bodies) {
+        while (!body.empty()) {
+            auto size = body.size();
+            if (reader + 1 < workers && size > remaining) {
+                const auto newline = body.find('\n', remaining - 1);
+                if (newline != body.npos) {
+                    size = newline + 1;
+                }
+            }
+            ranges[reader].push_back(body.substr(0, size));
+            body.remove_prefix(size);
+            if (reader + 1 < workers) {
+                if (size >= remaining) {
+                    ++reader;
+                    remaining = target;
+                } else {
+                    remaining -= size;
+                }
+            }
+        }
+    }
+
+    RowBatches routed(workers);
+    run_workers(workers, [&](std::size_t index) {
+        auto& batches = routed[index];
+        batches.resize(workers);
+        for (const auto range : ranges[index]) {
+            visit_rows(range, [&](View line) {
+                const auto shard = std::hash<View>{}(routing_id(line)) % workers;
+                batches[shard].push_back(line);
+            });
+        }
+    });
+    return routed;
+}
+
 struct IndexedWinner {
     View id;
     Winner record;
 };
 
-std::vector<IndexedWinner> choose_winners(const std::vector<View>& input) {
-    if (input.size() >= std::numeric_limits<Key>::max()) {
+std::vector<IndexedWinner> choose_winners(RowBatches& routed, std::size_t shard) {
+    std::size_t row_count = 0;
+    for (const auto& batches : routed) {
+        row_count += batches[shard].size();
+    }
+    if (row_count >= std::numeric_limits<Key>::max()) {
         throw std::overflow_error("event shard index overflow");
     }
     // The physical input row count bounds the number of distinct keys. Keep
     // buckets below 75% occupancy. Index zero denotes an empty bucket.
-    const auto bucket_count = std::bit_ceil(input.size() + input.size() / 3 + 2);
+    const auto bucket_count = std::bit_ceil(row_count + row_count / 3 + 2);
     std::vector<Key> buckets(bucket_count, 0);
     std::vector<IndexedWinner> winners;
-    winners.reserve(input.size());
-    for (const auto row : input) {
+    winners.reserve(row_count);
+    const auto consider = [&](View row) {
         const auto fields = parse_csv<7>(row);
         if (!fields || (*fields)[0].empty()) {
-            continue;
+            return;
         }
         const auto ingest = timestamp((*fields)[3]);
         if (!ingest) {
-            continue;
+            return;
         }
         const auto id = (*fields)[0];
         auto slot = std::hash<View>{}(id) & (bucket_count - 1);
@@ -449,6 +531,12 @@ std::vector<IndexedWinner> choose_winners(const std::vector<View>& input) {
                 current = {row, *ingest};
             }
         }
+    };
+    for (auto& batches : routed) {
+        for (const auto row : batches[shard]) {
+            consider(row);
+        }
+        std::vector<View>().swap(batches[shard]);
     }
     return winners;
 }
@@ -460,11 +548,11 @@ struct EventShard {
     double validate_seconds = 0;
 };
 
-EventShard load_shard(std::vector<View> rows, Window window, const Catalog& products, Key unknown) {
+EventShard load_shard(RowBatches& routed, std::size_t index, Window window,
+                      const Catalog& products, Key unknown) {
     EventShard shard;
     auto start = Clock::now();
-    const auto winners = choose_winners(rows);
-    std::vector<View>().swap(rows);
+    const auto winners = choose_winners(routed, index);
     shard.dedup_seconds = seconds(start);
 
     start = Clock::now();
@@ -498,38 +586,14 @@ std::vector<Event> load_events(Input& input, const Path& data, Window window, Id
     // views in the shard inputs and outputs borrow from immutable storage.
     start = Clock::now();
     const auto workers = worker_budget();
-    std::vector<std::vector<View>> routed(workers);
-    for (const auto& file : storage) {
-        rows(file.view(), [&](View line) {
-            const auto shard = std::hash<View>{}(routing_id(line)) % workers;
-            routed[shard].push_back(line);
-        });
-    }
+    auto routed = route_events(storage, workers);
     profile("event_route_seconds", start);
 
     start = Clock::now();
     std::vector<EventShard> shards(workers);
-    std::vector<std::exception_ptr> failures(workers);
-    {
-        std::vector<std::jthread> threads;
-        threads.reserve(workers - 1);
-        const auto build = [&](std::size_t i) {
-            try {
-                shards[i] = load_shard(std::move(routed[i]), window, products, unknown);
-            } catch (...) {
-                failures[i] = std::current_exception();
-            }
-        };
-        for (std::size_t i = 1; i < workers; ++i) {
-            threads.emplace_back(build, i);
-        }
-        build(0);
-    }
-    for (const auto& failure : failures) {
-        if (failure) {
-            std::rethrow_exception(failure);
-        }
-    }
+    run_workers(workers, [&](std::size_t i) {
+        shards[i] = load_shard(routed, i, window, products, unknown);
+    });
     profile("event_shards_wall_seconds", start);
     std::size_t count = 0;
     double dedup = 0;
@@ -574,6 +638,42 @@ struct Clicks {
     std::vector<Click> records;
 };
 
+class ClickIds {
+public:
+    bool insert(View id) {
+        auto* slot = find_slot(slots_, id);
+        if (!slot->empty()) {
+            return false;
+        }
+        if (size_ >= slots_.size() - slots_.size() / 4) {
+            std::vector<View> grown(slots_.size() * 2);
+            for (const auto entry : slots_) {
+                if (!entry.empty()) {
+                    *find_slot(grown, entry) = entry;
+                }
+            }
+            slots_.swap(grown);
+            slot = find_slot(slots_, id);
+        }
+        *slot = id;
+        ++size_;
+        return true;
+    }
+
+private:
+    std::vector<View> slots_ = std::vector<View>(256);
+    std::size_t size_ = 0;
+
+    static View* find_slot(std::vector<View>& slots, View id) {
+        const auto mask = slots.size() - 1;
+        auto index = std::hash<View>{}(id) & mask;
+        while (!slots[index].empty() && slots[index] != id) {
+            index = (index + 1) & mask;
+        }
+        return &slots[index];
+    }
+};
+
 void load_clicks(Input& input, const Path& data, Window window, Identities& ids,
                  const Catalog& campaigns, Clicks& clicks) {
     const auto files = partitions(data / "clicks");
@@ -584,7 +684,7 @@ void load_clicks(Input& input, const Path& data, Window window, Identities& ids,
     }
     profile(input.map_partitions ? "click_map_seconds" : "click_read_seconds", start);
     start = Clock::now();
-    std::unordered_set<View> seen;
+    ClickIds seen;
     for (const auto& file : clicks.storage) {
         rows(file.view(), [&](View line) {
             const auto fields = parse_csv<4>(line);
@@ -592,7 +692,7 @@ void load_clicks(Input& input, const Path& data, Window window, Identities& ids,
                 return;
             }
             const auto [id, user, campaign_name, click_time] = *fields;
-            if (!seen.insert(id).second || user.empty() || !valid_utf8(id) || !valid_utf8(user)) {
+            if (!seen.insert(id) || user.empty() || !valid_utf8(id) || !valid_utf8(user)) {
                 return;
             }
             const auto campaign = campaigns.ids.find(campaign_name);
