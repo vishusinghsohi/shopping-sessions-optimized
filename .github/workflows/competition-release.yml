@@ -1,0 +1,56 @@
+name: Competition release verification
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out exact revision
+        uses: actions/checkout@v4
+
+      - name: Verify required competition files
+        run: |
+          test -f Dockerfile
+          test -f cpp_engine/src/main.cpp
+          test -f cpp_engine/CMakeLists.txt
+          test -f scripts/docker_run.sh
+          test -f scripts/run_fixtures.py
+          test -d fixtures
+          test "$(find fixtures -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 36
+
+      - name: Install fixture comparator
+        run: |
+          python3 -m pip install --user 'polars>=1.30,<2'
+          python3 -c 'import polars; print("Polars", polars.__version__)'
+
+      - name: Build the exact competition target for the scorer architecture
+        run: docker build --platform linux/amd64 --target competition -t shopping-sessions:final .
+
+      - name: Check image entrypoint
+        run: |
+          docker image inspect shopping-sessions:final --format '{{json .Config.Cmd}}'
+          test "$(docker image inspect shopping-sessions:final --format '{{index .Architecture}}')" = amd64
+
+      - name: Validate all 36 official edge-case fixtures under scorer restrictions
+        env:
+          IMAGE: shopping-sessions:final
+          PLATFORM: linux/amd64
+          CPUS: '8'
+          MEM: 24g
+        run: python3 scripts/run_fixtures.py fixtures -- sh scripts/docker_run.sh
+
+      - name: Record tested commit
+        run: |
+          echo "Validated commit: $GITHUB_SHA"
+          echo "Docker target: competition"
+          echo "Platform: linux/amd64"
+          echo "Official hidden-runtime score: not measured by this workflow"
